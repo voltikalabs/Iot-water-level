@@ -20,13 +20,18 @@ const char pass[] = "123Strahmaj";
 
 // WiFiClientSecure net;// WSS
 WiFiClient net;  // Local
-MQTTClient client;
+MQTTClient client(256);
 
 unsigned long lastMillis = 0;
 
 #define EEPROM_SIZE 64
 #define ADDR_SP_LOW 0
 #define ADDR_SP_HIGH 4
+#define ADDR_SP_DLY_ON 8
+#define ADDR_SP_DLY_OFF 9
+#define ADDR_CONFIG_MAGIC 12
+
+const uint32_t CONFIG_MAGIC = 0x48574D31;  // "HWM1"
 
 #define RXD2 16
 #define TXD2 17
@@ -74,6 +79,13 @@ byte barFull[8] = { 31, 31, 31, 31, 31, 31, 31, 31 };  // full
 #define PUMP_STATUS (digitalRead(OUT_RLY_PUMP) == LOW)
 bool pumpStatus = false;
 
+enum PumpMode : uint8_t {
+  PUMP_MODE_AUTO,
+  PUMP_MODE_MANUAL
+};
+
+PumpMode pumpMode = PUMP_MODE_AUTO;
+
 #define VALVE_SWITCH 5
 #define SETUP_VALVE_SWITCH pinMode(VALVE_SWITCH, INPUT)
 #define VALVE_SWITCH_STATUS (digitalRead(VALVE_SWITCH) == HIGH)
@@ -82,8 +94,13 @@ bool pumpStatus = false;
 #define BOOSTER_ON digitalWrite(BOOSTER_RLY_PUMP, LOW)
 #define BOOSTER_OFF digitalWrite(BOOSTER_RLY_PUMP, HIGH)
 #define BOOSTER_STATUS (digitalRead(BOOSTER_RLY_PUMP) == LOW)
-uint8_t valveSwitchOnDetectDelaySec = 6;
-uint8_t valveSwitchOffDetectDelaySec = 2;
+uint8_t valveSwitchOnDetectDelaySec = 6; // Default
+uint8_t valveSwitchOffDetectDelaySec = 2; // Default
+
+char lastPayload[192] = "";
+
+void publishTelemetry(bool force = false);
+void publishConfigState(bool accepted, const char *message);
 
 void connectMQTT() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -103,6 +120,8 @@ void connectMQTT() {
     client.subscribe("dev/dev1/config");
 
     client.publish("dev/dev1/status", "online", true);
+    publishTelemetry(true);
+    publishConfigState(true, "connected");
 
   } else {
 
@@ -131,8 +150,13 @@ void setup() {
   Serial.begin(115200);
 #endif
   EEPROM.begin(EEPROM_SIZE);
-  saveSetPoint();
-  loadSetPoint();
+  if (!loadSetPoint()) {
+    SP_LOW = 79;
+    SP_HIGH = 31;
+    valveSwitchOnDetectDelaySec = 6;
+    valveSwitchOffDetectDelaySec = 2;
+    saveSetPoint();
+  }
 
   SETUP_VALVE_SWITCH;
   SETUP_BOOSTER_PUMP;
@@ -183,8 +207,6 @@ void setup() {
   client.onMessage(messageReceived);
 }
 
-char lastPayload[128] = "";  // simpan payload terakhir
-
 void loop() {
   connectWiFi();
   connectMQTT();
@@ -194,22 +216,7 @@ void loop() {
   if (millis() - lastMillis > 5000) {  // cek tiap 5 detik
     lastMillis = millis();
 
-    char payload[128];
-
-    snprintf(payload, sizeof(payload),
-             "{\"dist_cm\":%d,\"level_percent\":%d,\"pump\":%d,\"booster\":%d,\"valve\":%d}",
-             distCm,
-             levelPercent,
-             PUMP_STATUS,
-             BOOSTER_STATUS,
-             VALVE_SWITCH_STATUS);
-
-    // only publish if there is a data changed
-    if (strcmp(payload, lastPayload) != 0) {
-      client.publish("dev/dev1/telemetry", payload);
-      strcpy(lastPayload, payload);  // update payload terakhir
-      DBG("Published telemetry: " + String(payload));
-    }
+    publishTelemetry();
   }
 
   ///
@@ -254,7 +261,7 @@ void loop() {
     lastPercent = levelPercent;
   }
 
-  if (levelPercent <= 15 && !pumpStatus) {
+  if (pumpMode == PUMP_MODE_AUTO && levelPercent <= 15 && !pumpStatus) {
     if (prevMillis == 0) prevMillis = millis();
     if (((uint32_t)millis() - prevMillis) >= 5000) {  // If the level is less than 15% for 5 secs
                                                       // Turn on the pump
@@ -262,12 +269,11 @@ void loop() {
         pumpStatus = true;
         PUMP_ON;
         prevMillis = 0;
-        delay(1000);
         lcd.setCursor(19, 2);
         lcd.print(F("1"));
       }
     }
-  } else if (levelPercent >= 99 && pumpStatus) {
+  } else if (pumpMode == PUMP_MODE_AUTO && levelPercent >= 99 && pumpStatus) {
     if (prevMillis == 0) prevMillis = millis();
     if (((uint32_t)millis() - prevMillis) >= 5000) {  // If the level is greater than 99% for 5 secs
                                                       // Turn off the pump
@@ -355,6 +361,11 @@ int smoothDistance(int newVal) {
   static int readings[5] = { 0, 0, 0, 0, 0 };
   static int index = 0;
   static long total = 0;
+  static uint8_t readingCount = 0;
+
+  if (newVal <= 0 || newVal > 500) {
+    return readingCount > 0 ? total / readingCount : 0;
+  }
 
   // Remove the oldest reading from total
   total = total - readings[index];
@@ -363,45 +374,99 @@ int smoothDistance(int newVal) {
   readings[index] = newVal;
   total = total + newVal;
 
+  if (readingCount < 5) readingCount++;
+
   // Move to next index
   index = (index + 1) % 5;
 
   // Calculate and return the average
-  return total / 5;
+  return total / readingCount;
+}
+
+void publishTelemetry(bool force) {
+  if (!client.connected()) return;
+
+  char payload[192];
+  snprintf(payload, sizeof(payload),
+           "{\"schema\":1,\"uptime_ms\":%lu,\"dist_cm\":%d,\"level_percent\":%d,\"sensor_valid\":%s,\"pump\":%d,\"pump_mode\":\"%s\",\"booster\":%d,\"valve\":%d}",
+           millis(),
+           distCm,
+           levelPercent,
+           distCm > 0 ? "true" : "false",
+           PUMP_STATUS,
+           pumpMode == PUMP_MODE_AUTO ? "auto" : "manual",
+           BOOSTER_STATUS,
+           VALVE_SWITCH_STATUS);
+
+  // Retained snapshot lets a newly connected HWM app receive state immediately.
+  if (force || strcmp(payload, lastPayload) != 0) {
+    client.publish("dev/dev1/telemetry", payload, true, 1);
+    strlcpy(lastPayload, payload, sizeof(lastPayload));
+    DBG("Published telemetry: " + String(payload));
+  }
+}
+
+void publishConfigState(bool accepted, const char *message) {
+  if (!client.connected()) return;
+
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"schema\":1,\"ok\":%s,\"message\":\"%s\",\"sp_low\":%d,\"sp_high\":%d,\"dly_on\":%u,\"dly_off\":%u}",
+           accepted ? "true" : "false",
+           message,
+           SP_LOW,
+           SP_HIGH,
+           valveSwitchOnDetectDelaySec,
+           valveSwitchOffDetectDelaySec);
+  client.publish("dev/dev1/config/state", payload, true, 1);
 }
 
 void saveSetPoint() {
   EEPROM.put(ADDR_SP_LOW, SP_LOW);
   EEPROM.put(ADDR_SP_HIGH, SP_HIGH);
+  EEPROM.put(ADDR_SP_DLY_ON, valveSwitchOnDetectDelaySec);
+  EEPROM.put(ADDR_SP_DLY_OFF, valveSwitchOffDetectDelaySec);
+  EEPROM.put(ADDR_CONFIG_MAGIC, CONFIG_MAGIC);
   EEPROM.commit();
 }
 
-void loadSetPoint() {
+bool loadSetPoint() {
+  uint32_t configMagic = 0;
+  EEPROM.get(ADDR_CONFIG_MAGIC, configMagic);
   EEPROM.get(ADDR_SP_LOW, SP_LOW);
   EEPROM.get(ADDR_SP_HIGH, SP_HIGH);
+  EEPROM.get(ADDR_SP_DLY_ON, valveSwitchOnDetectDelaySec);
+  EEPROM.get(ADDR_SP_DLY_OFF, valveSwitchOffDetectDelaySec);
 
-  // validasi biar tidak baca sampah
-  if (SP_LOW < 10 || SP_LOW > 500) SP_LOW = 120;
-  if (SP_HIGH < 5 || SP_HIGH > 300) SP_HIGH = 20;
+  const bool valid = SP_LOW >= 10 && SP_LOW <= 500
+                     && SP_HIGH >= 5 && SP_HIGH < SP_LOW
+                     && valveSwitchOnDetectDelaySec <= 15
+                     && valveSwitchOffDetectDelaySec <= 15;
+  if (valid && configMagic != CONFIG_MAGIC) {
+    // Preserve valid settings written by firmware versions before CONFIG_MAGIC.
+    EEPROM.put(ADDR_CONFIG_MAGIC, CONFIG_MAGIC);
+    EEPROM.commit();
+  }
+  return valid;
 }
 
-int extractValue(String payload, String key) {
+bool extractInt(const String &payload, const char *key, int &value) {
+  int keyIndex = payload.indexOf("\"" + String(key) + "\"");
+  if (keyIndex < 0) return false;
 
-  int startIndex = payload.indexOf("\"" + key + "\":");
+  int valueIndex = payload.indexOf(':', keyIndex);
+  if (valueIndex < 0) return false;
+  valueIndex++;
 
-  if (startIndex == -1) return -1;
+  while (valueIndex < payload.length() && isspace(payload[valueIndex])) valueIndex++;
+  int endIndex = valueIndex;
+  if (endIndex < payload.length() && payload[endIndex] == '-') endIndex++;
+  int digitIndex = endIndex;
+  while (endIndex < payload.length() && isdigit(payload[endIndex])) endIndex++;
+  if (endIndex == digitIndex) return false;
 
-  startIndex += key.length() + 3;
-
-  int endIndex = payload.indexOf(",", startIndex);
-
-  if (endIndex == -1) {
-    endIndex = payload.indexOf("}", startIndex);
-  }
-
-  String value = payload.substring(startIndex, endIndex);
-
-  return value.toInt();
+  value = payload.substring(valueIndex, endIndex).toInt();
+  return true;
 }
 
 /*
@@ -424,25 +489,70 @@ void messageReceived(String &topic, String &payload) {
   DBG("CMD: " + topic + " -> " + payload);
 
   if (topic == "dev/dev1/cmd") {
-
-    if (payload.indexOf("\"pump\":1") >= 0) {
-      PUMP_ON;
-      pumpStatus = true;
+    if (payload.indexOf("get_state") >= 0) {
+      publishTelemetry(true);
+      publishConfigState(true, "state_requested");
+      return;
     }
 
-    if (payload.indexOf("\"pump\":0") >= 0) {
-      PUMP_OFF;
-      pumpStatus = false;
+    if (payload.indexOf("\"pump_mode\"") >= 0) {
+      if (payload.indexOf("\"auto\"") >= 0) {
+        pumpMode = PUMP_MODE_AUTO;
+        pumpStatus = PUMP_STATUS;
+        prevMillis = 0;
+        publishTelemetry(true);
+        return;
+      }
+
+      if (payload.indexOf("\"manual\"") >= 0) {
+        pumpMode = PUMP_MODE_MANUAL;
+        pumpStatus = PUMP_STATUS;
+        prevMillis = 0;
+        publishTelemetry(true);
+        return;
+      }
+    }
+
+    int requestedPump = 0;
+    if (extractInt(payload, "pump", requestedPump)
+        && (requestedPump == 0 || requestedPump == 1)) {
+      pumpMode = PUMP_MODE_MANUAL;
+      if (requestedPump == 1) {
+        PUMP_ON;
+        pumpStatus = true;
+      } else {
+        PUMP_OFF;
+        pumpStatus = false;
+      }
+      prevMillis = 0;
+      publishTelemetry(true);
     }
   }
 
   if (topic == "dev/dev1/config") {
+    int spLow = SP_LOW;
+    int spHigh = SP_HIGH;
+    int dlyOn = valveSwitchOnDetectDelaySec;
+    int dlyOff = valveSwitchOffDetectDelaySec;
 
-    int spLow = extractValue(payload, "sp_low");
-    int spHigh = extractValue(payload, "sp_high");
+    extractInt(payload, "sp_low", spLow);
+    extractInt(payload, "sp_high", spHigh);
+    extractInt(payload, "dly_on", dlyOn);
+    extractInt(payload, "dly_off", dlyOff);
 
-    if (spLow > 0) SP_LOW = spLow;
-    if (spHigh > 0) SP_HIGH = spHigh;
+    const bool valid = spLow >= 10 && spLow <= 500
+                       && spHigh >= 5 && spHigh < spLow
+                       && dlyOn >= 0 && dlyOn <= 15
+                       && dlyOff >= 0 && dlyOff <= 15;
+    if (!valid) {
+      publishConfigState(false, "invalid_config");
+      return;
+    }
+
+    SP_LOW = spLow;
+    SP_HIGH = spHigh;
+    valveSwitchOnDetectDelaySec = static_cast<uint8_t>(dlyOn);
+    valveSwitchOffDetectDelaySec = static_cast<uint8_t>(dlyOff);
 
     saveSetPoint();
 
@@ -453,5 +563,7 @@ void messageReceived(String &topic, String &payload) {
     lcd.printf("SP L: %03dcm H: %03dcm", distCmLow, distCmHigh);
 
     DBG("Config updated");
+    publishConfigState(true, "config_updated");
+    publishTelemetry(true);
   }
 }
