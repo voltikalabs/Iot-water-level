@@ -99,8 +99,21 @@ uint8_t valveSwitchOffDetectDelaySec = 2; // Default
 
 char lastPayload[192] = "";
 
+// MQTT callbacks must not publish/subscribe/unsubscribe. Publish and LCD work
+// is queued here, then executed after client.loop() has returned.
+bool telemetryPublishPending = false;
+bool configStatePublishPending = false;
+bool pendingConfigAccepted = false;
+char pendingConfigMessage[32] = "";
+bool lcdPumpStateRefreshPending = false;
+bool lcdConfigRefreshPending = false;
+
 void publishTelemetry(bool force = false);
 void publishConfigState(bool accepted, const char *message);
+void processPendingMqttWork();
+void queueTelemetryPublish();
+void queueConfigStatePublish(bool accepted, const char *message);
+void processPendingLcdWork();
 
 void connectMQTT() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -119,7 +132,7 @@ void connectMQTT() {
     client.subscribe("dev/dev1/cmd");
     client.subscribe("dev/dev1/config");
 
-    client.publish("dev/dev1/status", "online", true);
+    client.publish("dev/dev1/status", "online", true, 1);
     publishTelemetry(true);
     publishConfigState(true, "connected");
 
@@ -211,6 +224,8 @@ void loop() {
   connectWiFi();
   connectMQTT();
   client.loop();
+  processPendingMqttWork();
+  processPendingLcdWork();
   // delay(10);  // <- fixes some issues with WiFi stability
 
   if (millis() - lastMillis > 5000) {  // cek tiap 5 detik
@@ -294,9 +309,37 @@ void loop() {
   static unsigned long prevMillisSecs = millis();
   static uint8_t onCounter = 0;
   static uint8_t offCounter = 0;
+  static bool manualBoosterStateHandled = false;
 
-  // Statement true every second
-  if ((unsigned long)(millis() - prevMillisSecs) >= 1000) {
+  // Booster automation is disabled in manual pump mode. Reset the detection
+  // counters so returning to auto mode always starts a fresh valve delay.
+  if (pumpMode != PUMP_MODE_AUTO) {
+    onCounter = 0;
+    offCounter = 0;
+
+    if (!manualBoosterStateHandled || BOOSTER_STATUS) {
+      if (!manualBoosterStateHandled) {
+        prevMillisSecs = millis();
+      }
+      if (BOOSTER_STATUS) {
+        BOOSTER_OFF;
+      }
+      lcd.setCursor(19, 1);
+      lcd.print(F("0"));
+    }
+    manualBoosterStateHandled = true;
+
+    // Keep showing the physical valve state even though booster control is off.
+    if ((unsigned long)(millis() - prevMillisSecs) >= 1000) {
+      prevMillisSecs += 1000;
+      lcd.setCursor(15, 1);
+      lcd.print(VALVE_SWITCH_STATUS ? "1" : "0");
+    }
+  }
+  // Statement true every second while automatic mode is active.
+  else if ((unsigned long)(millis() - prevMillisSecs) >= 1000) {
+
+    manualBoosterStateHandled = false;
 
     prevMillisSecs += 1000;
 
@@ -421,6 +464,46 @@ void publishConfigState(bool accepted, const char *message) {
   client.publish("dev/dev1/config/state", payload, true, 1);
 }
 
+void queueTelemetryPublish() {
+  telemetryPublishPending = true;
+}
+
+void queueConfigStatePublish(bool accepted, const char *message) {
+  pendingConfigAccepted = accepted;
+  strlcpy(pendingConfigMessage, message, sizeof(pendingConfigMessage));
+  configStatePublishPending = true;
+}
+
+void processPendingMqttWork() {
+  if (!client.connected()) return;
+
+  // Clear each flag before publishing. If new work is queued while publishing,
+  // it remains pending for the next loop iteration.
+  if (configStatePublishPending) {
+    configStatePublishPending = false;
+    publishConfigState(pendingConfigAccepted, pendingConfigMessage);
+  }
+
+  if (telemetryPublishPending) {
+    telemetryPublishPending = false;
+    publishTelemetry(true);
+  }
+}
+
+void processPendingLcdWork() {
+  if (lcdConfigRefreshPending) {
+    lcdConfigRefreshPending = false;
+    lcd.setCursor(0, 0);
+    lcd.printf("SP L: %03dcm H: %03dcm", distCmLow, distCmHigh);
+  }
+
+  if (lcdPumpStateRefreshPending) {
+    lcdPumpStateRefreshPending = false;
+    lcd.setCursor(19, 2);
+    lcd.print(PUMP_STATUS ? F("1") : F("0"));
+  }
+}
+
 void saveSetPoint() {
   EEPROM.put(ADDR_SP_LOW, SP_LOW);
   EEPROM.put(ADDR_SP_HIGH, SP_HIGH);
@@ -490,8 +573,8 @@ void messageReceived(String &topic, String &payload) {
 
   if (topic == "dev/dev1/cmd") {
     if (payload.indexOf("get_state") >= 0) {
-      publishTelemetry(true);
-      publishConfigState(true, "state_requested");
+      queueTelemetryPublish();
+      queueConfigStatePublish(true, "state_requested");
       return;
     }
 
@@ -500,15 +583,16 @@ void messageReceived(String &topic, String &payload) {
         pumpMode = PUMP_MODE_AUTO;
         pumpStatus = PUMP_STATUS;
         prevMillis = 0;
-        publishTelemetry(true);
+        queueTelemetryPublish();
         return;
       }
 
       if (payload.indexOf("\"manual\"") >= 0) {
         pumpMode = PUMP_MODE_MANUAL;
         pumpStatus = PUMP_STATUS;
+        if (BOOSTER_STATUS) BOOSTER_OFF;
         prevMillis = 0;
-        publishTelemetry(true);
+        queueTelemetryPublish();
         return;
       }
     }
@@ -517,6 +601,7 @@ void messageReceived(String &topic, String &payload) {
     if (extractInt(payload, "pump", requestedPump)
         && (requestedPump == 0 || requestedPump == 1)) {
       pumpMode = PUMP_MODE_MANUAL;
+      if (BOOSTER_STATUS) BOOSTER_OFF;
       if (requestedPump == 1) {
         PUMP_ON;
         pumpStatus = true;
@@ -525,7 +610,8 @@ void messageReceived(String &topic, String &payload) {
         pumpStatus = false;
       }
       prevMillis = 0;
-      publishTelemetry(true);
+      lcdPumpStateRefreshPending = true;
+      queueTelemetryPublish();
     }
   }
 
@@ -545,7 +631,7 @@ void messageReceived(String &topic, String &payload) {
                        && dlyOn >= 0 && dlyOn <= 15
                        && dlyOff >= 0 && dlyOff <= 15;
     if (!valid) {
-      publishConfigState(false, "invalid_config");
+      queueConfigStatePublish(false, "invalid_config");
       return;
     }
 
@@ -559,11 +645,10 @@ void messageReceived(String &topic, String &payload) {
     distCmLow = SP_LOW;
     distCmHigh = SP_HIGH;
 
-    lcd.setCursor(0, 0);
-    lcd.printf("SP L: %03dcm H: %03dcm", distCmLow, distCmHigh);
+    lcdConfigRefreshPending = true;
 
     DBG("Config updated");
-    publishConfigState(true, "config_updated");
-    publishTelemetry(true);
+    queueConfigStatePublish(true, "config_updated");
+    queueTelemetryPublish();
   }
 }
