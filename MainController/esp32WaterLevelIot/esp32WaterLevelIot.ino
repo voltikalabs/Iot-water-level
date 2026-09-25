@@ -7,6 +7,7 @@
 // #include <WiFiClientSecure.h>
 #include <WiFiClient.h>
 #include <MQTT.h>
+#include "mqtt_secrets.h"
 
 #define DEBUG 0
 #if DEBUG
@@ -125,7 +126,7 @@ void connectMQTT() {
   DBG("MQTT connecting...");
 
   // net.setInsecure();
-  if (client.connect("dev1", "dev1", "dev1@mqtt.voltikalabs.web.id")) {
+  if (client.connect("dev1", MQTT_USERNAME, MQTT_PASSWORD)) {
 
     DBG("MQTT connected");
 
@@ -562,14 +563,14 @@ Kirim command pump ON:
 mosquitto_pub \
 -h localhost \
 -t dev/dev1/cmd \
--u aq -P aq@mqtt.voltikalabs.web.id \
+-u hwm-app -P '<PASSWORD_HWM>' \
 -m '{"pump":1}'
 
 Kirim config:
 mosquitto_pub \
 -h localhost \
 -t dev/dev1/config \
--u aq -P aq@mqtt.voltikalabs.web.id \
+-u hwm-app -P '<PASSWORD_HWM>' \
 -m '{"sp_low":80,"sp_high":30}'
 */
 

@@ -11,8 +11,8 @@ An IoT-based water tank monitoring and pump automation system using **Arduino Na
 - Automatic booster pump control
 - MQTT-based communication
 - Local and internet-based monitoring & control
-- Secure MQTT connection via WSS/TLS
-- Integrated with Mosquitto MQTT Broker on Raspberry Pi
+- Authenticated MQTT connection over the trusted LAN
+- Integrated with the Mosquitto broker on the VoltikaLabs M720q server
 
 ---
 
@@ -69,9 +69,24 @@ mqtt.voltikalabs.web.id
         │
   Cloudflare Tunnel
         │
- Raspberry Pi
+ Lenovo ThinkCentre M720q
  (Mosquitto Broker)
         │
    TCP : 1883 (LAN)
         │
    ESP32 / Local PC
+```
+
+## ESP32 MQTT credentials
+
+The ESP32 connects to `192.168.10.111:1883` with username
+`iot-water-level`. Its MQTT password must remain outside Git:
+
+1. Copy `MainController/esp32WaterLevelIot/mqtt_secrets.h.example` to
+   `MainController/esp32WaterLevelIot/mqtt_secrets.h`.
+2. Replace `REPLACE_WITH_DEVICE_PASSWORD` with the password assigned to the
+   `iot-water-level` account on the broker.
+3. Build and upload the sketch normally.
+
+The local `mqtt_secrets.h` file is ignored by Git. Do not put the real password
+in the sketch, README, commits, screenshots, or serial logs.
