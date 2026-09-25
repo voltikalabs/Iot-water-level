@@ -183,8 +183,13 @@ void setup() {
 
   distanceSerial.begin(4800, SERIAL_8N1, RXD2, TXD2);
 
+  // Initialize the LCD before starting WiFi/MQTT. Some I2C backpacks need a
+  // short power-stabilization delay or they can remain blank after a cold boot.
+  Wire.begin();
+  delay(200);
   lcd.init();
   lcd.backlight();
+  lcd.clear();
 
   lcd.createChar(0, barEmpty);
   lcd.createChar(1, arrow);
@@ -210,7 +215,7 @@ void setup() {
   //
   // MQTT brokers usually use port 8883 for secure connections.
   // client.begin("mqtt.voltikalabs.web.id", 443, net);
-  client.begin("192.168.0.101", 1883, net);
+  client.begin("192.168.10.111", 1883, net);
   // Auto set to offline status if device has been disconnected
   client.setWill(
     "dev/dev1/status",
