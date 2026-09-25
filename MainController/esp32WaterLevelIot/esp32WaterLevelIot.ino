@@ -8,6 +8,7 @@
 #include <WiFiClient.h>
 #include <MQTT.h>
 #include "mqtt_secrets.h"
+#include "wifi_secrets.h"
 
 #define DEBUG 0
 #if DEBUG
@@ -15,9 +16,6 @@
 #else
 #define DBG(x)
 #endif
-
-const char ssid[] = "SRJ_HomeSpot";
-const char pass[] = "123Strahmaj";
 
 // WiFiClientSecure net;// WSS
 WiFiClient net;  // Local
@@ -172,7 +170,7 @@ void connectWiFi() {
   if (millis() - lastAttempt > 5000) {
 
     DBG("WiFi reconnect...");
-    WiFi.begin(ssid, pass);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     lastAttempt = millis();
   }
@@ -231,7 +229,7 @@ void setup() {
   drawBar(0);          // example: 62%
 
   ///
-  WiFi.begin(ssid, pass);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 

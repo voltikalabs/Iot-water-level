@@ -106,3 +106,15 @@ The ESP32 connects to `192.168.10.111:1883` with username
 
 The local `mqtt_secrets.h` file is ignored by Git. Do not put the real password
 in the sketch, README, commits, screenshots, or serial logs.
+
+## ESP32 Wi-Fi credentials
+
+The Wi-Fi SSID and password must also remain outside Git:
+
+1. Copy `MainController/esp32WaterLevelIot/wifi_secrets.h.example` to
+   `MainController/esp32WaterLevelIot/wifi_secrets.h`.
+2. Replace the placeholder values with the local Wi-Fi SSID and password.
+3. Build and upload the sketch normally.
+
+The local `wifi_secrets.h` file is ignored by Git. Never put its real values in
+the sketch, README, commits, screenshots, or serial logs.

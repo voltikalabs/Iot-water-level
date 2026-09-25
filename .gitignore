@@ -1,2 +1,5 @@
 # Local MQTT credentials for the ESP32 firmware
 MainController/esp32WaterLevelIot/mqtt_secrets.h
+
+# Local Wi-Fi credentials for the ESP32 firmware
+MainController/esp32WaterLevelIot/wifi_secrets.h
