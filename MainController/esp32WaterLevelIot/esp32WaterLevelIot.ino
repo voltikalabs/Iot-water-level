@@ -31,8 +31,11 @@ unsigned long lastMillis = 0;
 #define ADDR_SP_DLY_ON 8
 #define ADDR_SP_DLY_OFF 9
 #define ADDR_CONFIG_MAGIC 12
+#define ADDR_AUTO_PUMP_LOCKOUT 16
+#define ADDR_PUMP_PROTECTION_MAGIC 20
 
 const uint32_t CONFIG_MAGIC = 0x48574D31;  // "HWM1"
+const uint32_t PUMP_PROTECTION_MAGIC = 0x504D5031;  // "PMP1"
 
 #define RXD2 16
 #define TXD2 17
@@ -50,6 +53,7 @@ int distCmHigh = 0;
 
 int levelPercent = 0;
 uint32_t prevMillis = 0;
+uint32_t lastValidDistanceMillis = 0;
 
 byte barEmpty[8] = {
   0b00000,
@@ -87,6 +91,16 @@ enum PumpMode : uint8_t {
 
 PumpMode pumpMode = PUMP_MODE_AUTO;
 
+const uint32_t PUMP_NO_RISE_TIMEOUT_MS = 60000;
+const uint32_t LOCKOUT_RESET_STABLE_MS = 10000;
+const uint32_t SENSOR_STALE_TIMEOUT_MS = 3000;
+const int MIN_LEVEL_RISE_PERCENT = 2;
+
+bool autoPumpLockout = false;
+uint32_t noRiseStartMillis = 0;
+int noRiseBaselinePercent = 0;
+uint32_t lockoutResetStartMillis = 0;
+
 #define VALVE_SWITCH 5
 #define SETUP_VALVE_SWITCH pinMode(VALVE_SWITCH, INPUT)
 #define VALVE_SWITCH_STATUS (digitalRead(VALVE_SWITCH) == HIGH)
@@ -98,7 +112,7 @@ PumpMode pumpMode = PUMP_MODE_AUTO;
 uint8_t valveSwitchOnDetectDelaySec = 6; // Default
 uint8_t valveSwitchOffDetectDelaySec = 2; // Default
 
-char lastPayload[192] = "";
+char lastPayload[224] = "";
 
 // MQTT callbacks must not publish/subscribe/unsubscribe. Publish and LCD work
 // is queued here, then executed after client.loop() has returned.
@@ -115,6 +129,11 @@ void processPendingMqttWork();
 void queueTelemetryPublish();
 void queueConfigStatePublish(bool accepted, const char *message);
 void processPendingLcdWork();
+void updateAutoPumpProtection();
+void setAutoPumpLockout(bool locked);
+void saveAutoPumpLockout();
+void loadAutoPumpLockout();
+bool isDistanceSensorFresh();
 
 void connectMQTT() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -171,6 +190,7 @@ void setup() {
     valveSwitchOffDetectDelaySec = 2;
     saveSetPoint();
   }
+  loadAutoPumpLockout();
 
   SETUP_VALVE_SWITCH;
   SETUP_BOOSTER_PUMP;
@@ -201,7 +221,11 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print(F("Dist : 000cm V:0 B:0"));
   lcd.setCursor(0, 2);
-  lcd.print(F("Level:000% NORMAL- 0"));  // "FULL  ", "NORMAL", "LOW   ", "V.LOW "
+  lcd.print(F("Level:000% NORMAL- 0"));  // "FULL  ", "NORMAL", "LOW   ", "V.LOW ", "LOCK  "
+  if (autoPumpLockout) {
+    lcd.setCursor(11, 2);
+    lcd.print(F("LOCK  "));
+  }
   lcd.setCursor(17, 2);
   lcd.write(byte(1));  // arrow
   drawBar(0);          // example: 62%
@@ -249,9 +273,12 @@ void loop() {
       lcd.setCursor(7, 1);
       lcd.print(F("   "));
       String strInt = charStr;
-      distCm = strInt.toInt();
+      int rawDistCm = strInt.toInt();
+      if (rawDistCm > 0 && rawDistCm <= 500) {
+        lastValidDistanceMillis = millis();
+      }
       // int distInt = distCm;
-      distCm = smoothDistance(distCm);
+      distCm = smoothDistance(rawDistCm);
       // DBG(String() + strInt + " " + distInt + " " + distCm);
       strcpy(charStr, "");
       sprintf(charStr, "%03d", distCm);
@@ -270,6 +297,7 @@ void loop() {
   static int lastPercent = -1;
   levelPercent = calculateLevelPercent(distCm);
   String status = getLevelStatus(levelPercent);
+  if (autoPumpLockout) status = "LOCK  ";
 
   if (levelPercent != lastPercent) {
     lcd.setCursor(6, 2);
@@ -282,7 +310,8 @@ void loop() {
     lastPercent = levelPercent;
   }
 
-  if (pumpMode == PUMP_MODE_AUTO && levelPercent <= 15 && !pumpStatus) {
+  if (pumpMode == PUMP_MODE_AUTO && !autoPumpLockout
+      && isDistanceSensorFresh() && levelPercent <= 15 && !pumpStatus) {
     if (prevMillis == 0) prevMillis = millis();
     if (((uint32_t)millis() - prevMillis) >= 5000) {  // If the level is less than 15% for 5 secs
                                                       // Turn on the pump
@@ -310,6 +339,8 @@ void loop() {
     // do nothing
     prevMillis = 0;
   }
+
+  updateAutoPumpProtection();
 
   /// Booster Pump Management Relay
   static unsigned long prevMillisSecs = millis();
@@ -435,15 +466,16 @@ int smoothDistance(int newVal) {
 void publishTelemetry(bool force) {
   if (!client.connected()) return;
 
-  char payload[192];
+  char payload[224];
   snprintf(payload, sizeof(payload),
-           "{\"schema\":1,\"uptime_ms\":%lu,\"dist_cm\":%d,\"level_percent\":%d,\"sensor_valid\":%s,\"pump\":%d,\"pump_mode\":\"%s\",\"booster\":%d,\"valve\":%d}",
+           "{\"schema\":1,\"uptime_ms\":%lu,\"dist_cm\":%d,\"level_percent\":%d,\"sensor_valid\":%s,\"pump\":%d,\"pump_mode\":\"%s\",\"auto_lockout\":%s,\"booster\":%d,\"valve\":%d}",
            millis(),
            distCm,
            levelPercent,
-           distCm > 0 ? "true" : "false",
+           isDistanceSensorFresh() ? "true" : "false",
            PUMP_STATUS,
            pumpMode == PUMP_MODE_AUTO ? "auto" : "manual",
+           autoPumpLockout ? "true" : "false",
            BOOSTER_STATUS,
            VALVE_SWITCH_STATUS);
 
@@ -517,6 +549,114 @@ void saveSetPoint() {
   EEPROM.put(ADDR_SP_DLY_OFF, valveSwitchOffDetectDelaySec);
   EEPROM.put(ADDR_CONFIG_MAGIC, CONFIG_MAGIC);
   EEPROM.commit();
+}
+
+void saveAutoPumpLockout() {
+  EEPROM.put(ADDR_AUTO_PUMP_LOCKOUT, static_cast<uint8_t>(autoPumpLockout ? 1 : 0));
+  EEPROM.put(ADDR_PUMP_PROTECTION_MAGIC, PUMP_PROTECTION_MAGIC);
+  EEPROM.commit();
+}
+
+void loadAutoPumpLockout() {
+  uint32_t protectionMagic = 0;
+  uint8_t storedLockout = 0;
+  EEPROM.get(ADDR_PUMP_PROTECTION_MAGIC, protectionMagic);
+  EEPROM.get(ADDR_AUTO_PUMP_LOCKOUT, storedLockout);
+
+  if (protectionMagic == PUMP_PROTECTION_MAGIC && storedLockout <= 1) {
+    autoPumpLockout = storedLockout == 1;
+    return;
+  }
+
+  // Firmware upgrades must start unlocked when this EEPROM field does not yet
+  // exist. Future lockouts are then persisted across controller restarts.
+  autoPumpLockout = false;
+  saveAutoPumpLockout();
+}
+
+void setAutoPumpLockout(bool locked) {
+  if (autoPumpLockout == locked) return;
+
+  autoPumpLockout = locked;
+  saveAutoPumpLockout();
+  queueTelemetryPublish();
+
+  lcd.setCursor(11, 2);
+  if (locked) {
+    lcd.print(F("LOCK  "));
+  } else {
+    lcd.print(getLevelStatus(levelPercent));
+  }
+}
+
+bool isDistanceSensorFresh() {
+  return lastValidDistanceMillis != 0
+         && (uint32_t)(millis() - lastValidDistanceMillis) <= SENSOR_STALE_TIMEOUT_MS;
+}
+
+void updateAutoPumpProtection() {
+  const uint32_t now = millis();
+
+  // A manual physical pump can refill the tank while the controller relay is
+  // locked out. Require a stable reading above 20% before restoring AUTO.
+  if (autoPumpLockout) {
+    if (levelPercent > 20 && isDistanceSensorFresh()) {
+      if (lockoutResetStartMillis == 0) lockoutResetStartMillis = now;
+
+      if ((uint32_t)(now - lockoutResetStartMillis) >= LOCKOUT_RESET_STABLE_MS) {
+        lockoutResetStartMillis = 0;
+        setAutoPumpLockout(false);
+      }
+    } else {
+      lockoutResetStartMillis = 0;
+    }
+
+    if (pumpMode == PUMP_MODE_AUTO && PUMP_STATUS) {
+      PUMP_OFF;
+      pumpStatus = false;
+      lcd.setCursor(19, 2);
+      lcd.print(F("0"));
+    }
+
+    noRiseStartMillis = 0;
+    return;
+  }
+
+  lockoutResetStartMillis = 0;
+
+  // This protection intentionally does not monitor or interrupt manual mode.
+  // Open valve / active booster means consumption can hide a working pump's
+  // level increase, so start a fresh observation window once demand stops.
+  const bool canObserveNoRise = pumpMode == PUMP_MODE_AUTO
+                                && PUMP_STATUS
+                                && !VALVE_SWITCH_STATUS
+                                && !BOOSTER_STATUS;
+  if (!canObserveNoRise) {
+    noRiseStartMillis = 0;
+    return;
+  }
+
+  if (noRiseStartMillis == 0) {
+    noRiseStartMillis = now;
+    noRiseBaselinePercent = levelPercent;
+    return;
+  }
+
+  if (levelPercent >= noRiseBaselinePercent + MIN_LEVEL_RISE_PERCENT) {
+    noRiseStartMillis = now;
+    noRiseBaselinePercent = levelPercent;
+    return;
+  }
+
+  if ((uint32_t)(now - noRiseStartMillis) >= PUMP_NO_RISE_TIMEOUT_MS) {
+    PUMP_OFF;
+    pumpStatus = false;
+    prevMillis = 0;
+    noRiseStartMillis = 0;
+    lcd.setCursor(19, 2);
+    lcd.print(F("0"));
+    setAutoPumpLockout(true);
+  }
 }
 
 bool loadSetPoint() {

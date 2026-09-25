@@ -37,6 +37,22 @@ The tank filling pump operates automatically based on water level percentage.
 
 This mechanism ensures the tank always maintains sufficient water availability.
 
+### Automatic Pump Protection
+
+The dry-run/no-flow protection is active only while the tank pump is in
+automatic mode. While the pump is ON, the controller observes the tank level
+when the valve is closed and the booster is OFF.
+
+- If the level does not rise by at least `2%` within `60 seconds`, the tank pump
+  is switched OFF and automatic control enters lockout.
+- Automatic start and lockout reset require a recent valid level reading; a
+  stalled sensor cannot leave the automatic pump running indefinitely.
+- Manual pump mode is not monitored or interrupted by this protection.
+- The lockout is stored in EEPROM and therefore survives a controller restart.
+- A physical/manual pump switch can be used to restore the water supply.
+- The lockout clears after the tank remains above `20%` for `10 seconds`.
+- MQTT telemetry exposes the protection state as `auto_lockout`.
+
 ---
 
 ## 3. Booster Pump Automation
